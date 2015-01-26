@@ -136,16 +136,9 @@
             (apply core/set-env! (->> initial-env (mapcat identity) seq))
             (try (doto tmpf (spit scriptstr) (load-file))
                  (catch clojure.lang.Compiler$CompilerException cx
-            (println (io/file (.-source cx)))
-            (println (->> (io/file (.-source cx))
-                             (file/relative-to (io/file "."))))
-            (println (->> (io/file (.-source cx))
-                             (file/relative-to (io/file "."))
-                             .getPath))
                    (let [l (.-line cx)
                          s (->> (io/file (.-source cx))
-                             (file/relative-to (io/file "."))
-                             .getPath)
+                             (file/relative-to (io/file ".")))
                          c (.getCause cx)
                          m (.getMessage (or c cx))
                          x (or c cx)]

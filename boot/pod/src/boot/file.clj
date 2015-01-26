@@ -16,19 +16,14 @@
 (def ^:dynamic *exclude*     nil)
 (def ^:dynamic *ignore*      nil)
 (def ^:dynamic *sync-delete* true)
-(def ^:dynamic *hard-link*   true)
+(def ^:dynamic *hard-link*   false)
 
 (defn file? [f] (when (try (.isFile (io/file f)) (catch Throwable _)) f))
 (defn dir? [f] (when (try (.isDirectory (io/file f)) (catch Throwable _)) f))
 (defn exists? [f] (when (try (.exists (io/file f)) (catch Throwable _)) f))
 (defn path [f] (.getPath (io/file f)))
 (defn name [f] (.getName (io/file f)))
-(defn parent [f]
-  (println "getting parent of f")
-  (println f)
-  (println (io/file f))
-  (println (.getParentFile (io/file f)))
-  (.getParentFile (io/file f)))
+(defn parent [f] (.getParentFile (io/file f)))
 (defn file-seq [dir] (when dir (clojure.core/file-seq dir)))
 
 (defmacro guard [& exprs]
@@ -76,29 +71,13 @@
 (defn relative-to
   "Return relative path to f from directory base."
   [base f]
-  (print 555)
-  (println "blah")
-  (println "relative-to (->)")
-  (println base)
-  (println f)
   (loop [base base
          parts []]
     (if base
       (if (parent? base f)
-        (do
-          (println "got here 1")
-        (URI. (str (apply io/file (concat parts [(str (.relativize (.toURI base) (.toURI f)))]))))
-          )
-        (do
-          (println "got here 2")
+        (str (apply io/file (concat parts [(str (.relativize (.toURI base) (.toURI f)))])))
         (recur (parent base) (conj parts "..")))
-        )
-      (do
-        (println "got here 3")
-        (println (split-path f))
-        (print (concat parts (split-path f)))
-        (print (str (apply io/file (concat parts (split-path f)))))
-      (URI. (str (apply io/file (concat parts (split-path f)))))))))
+      (str (apply io/file (concat parts (split-path f)))))))
 
 (defn lockfile
   [f]

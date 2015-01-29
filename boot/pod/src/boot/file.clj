@@ -79,6 +79,13 @@
         (recur (parent base) (conj parts "..")))
       (str (apply io/file (concat parts (split-path f)))))))
 
+(defn relative-file-to-uri
+  "Return a relative URI given a file reference"
+  [f]
+  (let [rel-path-length (-> f .toPath .getNameCount)
+        abs-prefix (-> f .getAbsoluteFile parent-seq (nth rel-path-length) .toPath)]
+    (.relativize (.toUri abs-prefix) (.toURI f))))
+
 (defn lockfile
   [f]
   (let [f (io/file f)]

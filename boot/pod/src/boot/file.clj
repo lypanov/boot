@@ -16,7 +16,7 @@
 (def ^:dynamic *exclude*     nil)
 (def ^:dynamic *ignore*      nil)
 (def ^:dynamic *sync-delete* true)
-(def ^:dynamic *hard-link*   false)
+(def ^:dynamic *hard-link*   true)
 
 (defn file? [f] (when (try (.isFile (io/file f)) (catch Throwable _)) f))
 (defn dir? [f] (when (try (.isDirectory (io/file f)) (catch Throwable _)) f))
@@ -78,13 +78,6 @@
         (str (apply io/file (concat parts [(str (.relativize (.toURI base) (.toURI f)))])))
         (recur (parent base) (conj parts "..")))
       (str (apply io/file (concat parts (split-path f)))))))
-
-(defn relative-file-to-uri
-  "Return a relative URI given a file reference"
-  [f]
-  (let [rel-path-length (-> f .toPath .getNameCount)
-        abs-prefix (-> f .getAbsoluteFile parent-seq (nth rel-path-length) .toPath)]
-    (.relativize (.toUri abs-prefix) (.toURI f))))
 
 (defn lockfile
   [f]

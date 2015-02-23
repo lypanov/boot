@@ -27,12 +27,12 @@
     (let [tasks (#'helpers/available-tasks 'boot.user)
           opts  (->> main/cli-opts (mapv (fn [[x y z]] ["" (str x " " y) z])))
           envs  [["" "BOOT_AS_ROOT"         "Set to 'yes' to allow boot to run as root."]
-                 ["" "BOOT_CHANNEL"         "Set to 'DEV' to update boot via the testing branch."]
                  ["" "BOOT_CLOJURE_VERSION" "The version of Clojure boot will provide (1.6.0)."]
                  ["" "BOOT_HOME"            "Directory where boot stores global state (~/.boot)."]
                  ["" "BOOT_JVM_OPTIONS"     "Specify JVM options (Unix/Linux/OSX only)."]
                  ["" "BOOT_LOCAL_REPO"      "The local Maven repo path (~/.m2/repository)."]
-                 ["" "BOOT_VERSION"         "Specify the version of boot core to use."]]
+                 ["" "BOOT_VERSION"         "Specify the version of boot core to use."]
+                 ["" "BOOT_COLOR"           "Turn colorized output on or off"]]
           files [["" "./.boot"              "Directory where boot stores local state."]
                  ["" "./build.boot"         "The build script for this project."]
                  ["" "./boot.properties"    "Specify boot and clj versions for this project."]
@@ -104,7 +104,8 @@
    f fileset          bool "Print the build fileset object."
    u updates          bool "Print newer releases of outdated dependencies."
    U update-snapshots bool "Include snapshot versions in updates searches."
-   c classpath        bool "Print the project's full classpath."]
+   c classpath        bool "Print the project's full classpath."
+   C fake-classpath   bool "Print the project's fake classpath."]
 
   (let [updates (or updates update-snapshots (not (or deps env fileset classpath)))]
     (core/with-pre-wrap fileset'
@@ -112,6 +113,7 @@
       (when env     (println (pr-str (core/get-env))))
       (when fileset (println (pr-str fileset')))
       (when classpath (println (or (System/getProperty "boot.class.path") "")))
+      (when fake-classpath (println (or (System/getProperty "fake.class.path") "")))
       (when updates (mapv prn (pod/outdated (core/get-env) :snapshots update-snapshots)))
       fileset')))
 
@@ -132,17 +134,17 @@
   Debouncing time is 10ms by default."
 
   [q quiet         bool "Suppress all output from running jobs."
-   d debounce MSEC int "The time to wait (millisec) for filesystem to settle down."
    v verbose       bool "Print which files have changed."]
 
   (pod/require-in @pod/worker-pod "boot.watcher")
   (fn [next-task]
     (fn [fileset]
-      (let [q       (LinkedBlockingQueue.)
-            k       (gensym)
-            return  (atom fileset)
-            srcdirs (map (memfn getPath) (core/user-dirs fileset))
-            watcher (apply file/watcher! :time srcdirs)]
+      (let [q        (LinkedBlockingQueue.)
+            k        (gensym)
+            return   (atom fileset)
+            srcdirs  (map (memfn getPath) (core/user-dirs fileset))
+            watcher  (apply file/watcher! :time srcdirs)
+            debounce (core/get-env :watcher-debounce)]
         (.offer q (System/currentTimeMillis))
         (add-watch core/last-file-change k #(.offer q %4))
         (core/cleanup (remove-watch core/last-file-change k))
@@ -184,7 +186,6 @@
 
   [s server         bool  "Start REPL server only."
    c client         bool  "Start REPL client only."
-   C no-color       bool  "Disable ANSI color output in client."
    e eval EXPR      edn   "The form the client will evaluate in the boot.user ns."
    b bind ADDR      str   "The address server listens on."
    H host HOST      str   "The host client connects to."
@@ -198,10 +199,10 @@
   (let [srv-opts (select-keys *opts* [:bind :port :init-ns :middleware :handler])
         cli-opts (-> *opts*
                      (select-keys [:host :port :history])
-                     (assoc :color (not no-color)
-                            :standalone true
+                     (assoc :standalone true
                             :custom-eval eval
                             :custom-init init
+                            :color @util/*colorize?*
                             :skip-default-init skip-init))
         deps     (remove pod/dependency-loaded? @repl/*default-dependencies*)
         repl-svr (delay (when (seq deps)
@@ -429,11 +430,12 @@
                       (map core/tmppath)
                       (filter #(.endsWith % ".clj"))
                       (map util/path->ns)
-                      (filter #(or all (contains? namespace %))))]
+                      (filter #(or all (contains? namespace %)))
+                      sort)]
         (pod/with-eval-in @compile-pod
           (binding [*compile-path* ~(.getPath tgt)]
-            (doseq [ns '~nses]
-              (boot.util/info "Compiling %s...\n" ns)
+            (doseq [[idx ns] (map-indexed vector '~nses)]
+              (boot.util/info "Compiling %s/%s %s...\n" (inc idx) (count '~nses) ns)
               (compile ns)))))
       (-> fileset (core/add-resource tgt) core/commit!))))
 
@@ -444,7 +446,8 @@
     (core/with-pre-wrap fileset
       (let [throw?    (atom nil)
             diag-coll (DiagnosticCollector.)
-            compiler  (ToolProvider/getSystemJavaCompiler)
+            compiler  (or (ToolProvider/getSystemJavaCompiler)
+                          (throw (Exception. "The java compiler is not working. Please make sure you use a JDK!")))
             file-mgr  (.getStandardFileManager compiler diag-coll nil nil)
             opts      (->> ["-d"  (.getPath tgt)
                             "-cp" (System/getProperty "boot.class.path")]
@@ -459,16 +462,20 @@
                                Arrays/asList
                                (.getJavaFileObjectsFromFiles file-mgr))]
         (when srcs
-          (util/info "Compiling Java classes...\n")
+          (util/info "Compiling %d Java source files...\n" (count srcs))
           (-> compiler (.getTask *err* file-mgr diag-coll opts nil srcs) .call)
           (doseq [d (.getDiagnostics diag-coll) :let [k (.getKind d)]]
             (when (= Diagnostic$Kind/ERROR k) (reset! throw? true))
             (let [log (handler k util/info)]
-              (log "%s: %s, line %d: %s\n"
-                   (.toString k)
-                   (.. d getSource getName)
-                   (.getLineNumber d)
-                   (.getMessage d nil))))
+              (if (nil? (.getSource d))
+                (log "%s: %s\n"
+                     (.toString k)
+                     (.getMessage d nil))
+                (log "%s: %s, line %d: %s\n"
+                     (.toString k)
+                     (.. d getSource getName)
+                     (.getLineNumber d)
+                     (.getMessage d nil)))))
           (.close file-mgr)
           (when @throw? (throw (Exception. "java compiler error")))))
       (-> fileset (core/add-resource tgt) core/commit!))))

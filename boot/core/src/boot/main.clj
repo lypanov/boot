@@ -28,7 +28,7 @@
    ["-s" "--source-paths PATH"   "Add PATH to set of source directories."
     :assoc-fn #(update-in %1 [%2] (fnil conj #{}) %3)]
    ["-t" "--target-path PATH"    "Set the target directory to PATH."]
-   ["-u" "--update"              "Update boot (see BOOT_CHANNEL env var below)."]
+   ["-u" "--update"              "Update boot to latest release version."]
    ["-v" "--verbose"             "More error info (-vv more verbose, etc.)"
     :assoc-fn (fn [x y _] (update-in x [y] (fnil inc 0)))]
    ["-V" "--version"             "Print boot version info."]])
@@ -83,7 +83,7 @@
 
   (let [dotboot?         #(.endsWith (.getName (io/file %)) ".boot")
         script?          #(when (and % (.isFile (io/file %)) (dotboot? %)) %)
-        bootscript       (io/file "build.boot")
+        bootscript       "build.boot"
         have-bootscript? (script? bootscript)
         [arg0 args]      (cond
                            (script? arg0)   [arg0 args]
@@ -100,6 +100,7 @@
     (binding [*out*               (util/auto-flush *out*)
               *err*               (util/auto-flush *err*)
               core/*boot-opts*    opts
+              core/*boot-script*  arg0
               core/*boot-version* (boot.App/getBootVersion)
               core/*app-version*  (boot.App/getVersion)]
       (util/exit-ok
@@ -121,7 +122,8 @@
               scriptstr   (binding [*print-meta* true]
                             (str (string/join "\n\n" (map pr-str scriptforms)) "\n"))]
 
-          (reset! util/*colorize?* (not (:no-colors opts)))
+          (when (:no-colors opts)
+            (reset! util/*colorize?* false))
           (swap! util/*verbosity* + verbosity)
           (pod/with-eval-in worker-pod
             (require '[boot.util :as util])
@@ -134,11 +136,11 @@
           (let [tmpf (.getPath (file/tmpfile "boot.user" ".clj"))]
             (pod/with-call-worker (boot.aether/load-wagon-mappings))
             (apply core/set-env! (->> initial-env (mapcat identity) seq))
+            (reset! @#'core/cli-base initial-env)
             (try (doto tmpf (spit scriptstr) (load-file))
                  (catch clojure.lang.Compiler$CompilerException cx
                    (let [l (.-line cx)
-                         s (->> (io/file (.-source cx))
-                             (file/relative-to (io/file ".")))
+                         s (->> (io/file (.-source cx)) .getPath)
                          c (.getCause cx)
                          m (.getMessage (or c cx))
                          x (or c cx)]

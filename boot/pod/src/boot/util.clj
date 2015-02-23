@@ -18,8 +18,24 @@
 
 (declare print-ex)
 
+(defn colorize?-system-default
+  "return whether we should colorize output on this system. This is
+  true, unless we're on Windows, where this is false. The default
+  console on Windows does not interprete ansi escape codes. The
+  default can be overriden by setting the environment variable
+  BOOT_COLOR=1 or BOOT_COLOR=yes to turn it on or any other value to
+  turn it off."
+  []
+  (cond
+    (System/getenv "BOOT_COLOR")
+      (contains? #{"1" "yes"} (System/getenv "BOOT_COLOR"))
+    (.startsWith (System/getProperty "os.name") "Windows")
+      false
+    :else
+      true))
+
 (def ^:dynamic *verbosity* (atom 1))
-(def ^:dynamic *colorize?* (atom true))
+(def ^:dynamic *colorize?* (atom (colorize?-system-default)))
 
 (defn- print*
   [verbosity args]
@@ -113,7 +129,11 @@
 
 (defn auto-flush
   [writer]
-  (let [fmt #(if @*colorize?* % (ansi/strip-ansi %))]
+  (let [fmt (if @*colorize?*
+              identity
+              (fn [s] (if (string? s)
+                        (ansi/strip-ansi s)
+                        s)))]
     (proxy [java.io.PrintWriter] [writer]
       (write [s] (.write writer (fmt s)) (flush)))))
 

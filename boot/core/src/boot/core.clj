@@ -21,17 +21,19 @@
     [java.lang.management ManagementFactory]
     [java.util.concurrent LinkedBlockingQueue TimeUnit]))
 
-(declare watch-dirs sync! on-env! get-env set-env! tmpfile tmpdir ls)
+(declare watch-dirs sync! post-env! get-env set-env! tmpfile tmpdir ls)
 
-(declare ^{:dynamic true :doc "The running version of boot app."}      *app-version*)
-(declare ^{:dynamic true :doc "The running version of boot core."}     *boot-version*)
-(declare ^{:dynamic true :doc "Command line options for boot itself."} *boot-opts*)
-(declare ^{:dynamic true :doc "Count of warnings during build."}       *warnings*)
+(declare ^{:dynamic true :doc "The running version of boot app."}        *app-version*)
+(declare ^{:dynamic true :doc "The script's name (when run as script)."} *boot-script*)
+(declare ^{:dynamic true :doc "The running version of boot core."}       *boot-version*)
+(declare ^{:dynamic true :doc "Command line options for boot itself."}   *boot-opts*)
+(declare ^{:dynamic true :doc "Count of warnings during build."}         *warnings*)
 
 (def last-file-change "Last source file watcher update time." (atom 0))
 
 ;; Internal helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(def ^:private cli-base          (atom {}))
 (def ^:private tmpregistry       (atom nil))
 (def ^:private cleanup-fns       (atom []))
 (def ^:private boot-env          (atom nil))
@@ -111,7 +113,7 @@
   directories are not actually on the class path (this is why it's the fake
   class path). This property is a workaround for IDEs and tools that expect
   the full class path to be determined by the java.class.path property.
-  
+
   Also sets the boot.class.path system property which is the same as above
   except that the actual class path directories are used instead of the user's
   project directories. This property can be used to configure Java tools that
@@ -135,17 +137,16 @@
   corresponding temp dirs, reflecting any changes to :source-paths, etc."
   []
   (@src-watcher)
-  (->> [:source-paths :resource-paths :asset-paths]
-    (mapcat get-env)
-    (filter #(.isDirectory (io/file %)))
-    set
-    (watch-dirs
-      (fn [_]
-        (sync-user-dirs!)
-        (reset! last-file-change (System/currentTimeMillis))))
-    (reset! src-watcher))
-  (set-fake-class-path!)
-  (sync-user-dirs!))
+  (let [debounce  (or (get-env :watcher-debounce) 10)
+        env-keys  [:source-paths :resource-paths :asset-paths]
+        dir-paths (set (->> (mapcat get-env env-keys)
+                            (filter #(.isDirectory (io/file %)))))
+        on-change (fn [_]
+                    (sync-user-dirs!)
+                    (reset! last-file-change (System/currentTimeMillis)))]
+    (reset! src-watcher (watch-dirs on-change dir-paths :debounce debounce))
+    (set-fake-class-path!)
+    (sync-user-dirs!)))
 
 (defn- do-cleanup!
   "Cleanup handler. This is run after the build process is complete. Tasks can
@@ -174,10 +175,34 @@
   (#'clojure.core/load-data-readers)
   (set! *data-readers* (.getRawRoot #'*data-readers*)))
 
+(defn- find-version-conflicts
+  "compute a seq of [name new-coord old-coord] elements describing version conflicts
+   when resolving the 'old' dependency vector and the 'new' dependency vector"
+  [old new env]
+  (let [resolve-deps (fn [deps] (->> deps
+                                     rm-clojure-dep
+                                     (assoc env :dependencies)
+                                     pod/resolve-dependencies
+                                     (map (juxt (comp first :dep) (comp second :dep)))
+                                     (into {})))
+        old-deps (resolve-deps old)
+        new-deps (resolve-deps new)]
+    (->> new-deps
+         (map (fn [[name coord]] [name coord (get old-deps name coord)]))
+         (remove (fn [[name new-coord old-coord]] (= new-coord old-coord))))))
+
+(defn- report-version-conflicts
+  "Warn, when the version of a dependency changes. Call this with the
+  result of find-version-conflicts as arguments"
+  [coll]
+  (doseq [[name new-coord old-coord] coll]
+    (util/warn "Warning: version conflict detected: %s version changes from %s to %s\n" name old-coord new-coord)))
+
 (defn- add-dependencies!
   "Add Maven dependencies to the classpath, fetching them if necessary."
   [old new env]
   (assert (vector? new) "env :dependencies must be a vector")
+  (report-version-conflicts (find-version-conflicts old new env))
   (->> new rm-clojure-dep (assoc env :dependencies) pod/add-dependencies)
   (set-fake-class-path!)
   new)
@@ -196,7 +221,7 @@
   (doseq [k (set/union (set (keys old)) (set (keys new)))]
     (let [o (get old k ::noval)
           n (get new k ::noval)]
-      (when (not= o n) (on-env! k o n new)))))
+      (when (not= o n) (post-env! k o n new)))))
 
 (defn- add-wagon!
   "Adds a maven wagon dependency to the worker pod and initializes it with an
@@ -490,14 +515,15 @@
        tmp/init!
        (reset! tmpregistry))
   (doto boot-env
-    (reset! {:dependencies   []
-             :directories    #{}
-             :source-paths   #{}
-             :resource-paths #{}
-             :asset-paths    #{}
-             :target-path    "target"
-             :repositories   [["clojars"       "http://clojars.org/repo/"]
-                              ["maven-central" "http://repo1.maven.org/maven2/"]]})
+    (reset! {:watcher-debounce 10
+             :dependencies     []
+             :directories      #{}
+             :source-paths     #{}
+             :resource-paths   #{}
+             :asset-paths      #{}
+             :target-path      "target"
+             :repositories     [["clojars"       "http://clojars.org/repo/"]
+                                ["maven-central" "http://repo1.maven.org/maven2/"]]})
     (add-watch ::boot #(configure!* %3 %4)))
   (set-fake-class-path!)
   (temp-dir** nil :asset)
@@ -508,34 +534,37 @@
   (temp-dir** nil :user :resource)
   (pod/add-shutdown-hook! do-cleanup!))
 
-(defmulti on-env!
-  "Event handler called when the boot atom is modified. This handler is for
+(defmulti post-env!
+  "Event handler called when the env atom is modified. This handler is for
   performing side-effects associated with maintaining the application state in
-  the boot atom. For example, when `:src-paths` is modified the handler adds
+  the env atom. For example, when `:src-paths` is modified the handler adds
   the new directories to the classpath."
   (fn [key old-value new-value env] key) :default ::default)
 
-(defmethod on-env! ::default       [key old new env] nil)
-(defmethod on-env! :directories    [key old new env] (add-directories! new))
-(defmethod on-env! :source-paths   [key old new env] (set-user-dirs!))
-(defmethod on-env! :resource-paths [key old new env] (set-user-dirs!))
-(defmethod on-env! :asset-paths    [key old new env] (set-user-dirs!))
+(defmethod post-env! ::default         [key old new env] nil)
+(defmethod post-env! :directories      [key old new env] (add-directories! new))
+(defmethod post-env! :source-paths     [key old new env] (set-user-dirs!))
+(defmethod post-env! :resource-paths   [key old new env] (set-user-dirs!))
+(defmethod post-env! :asset-paths      [key old new env] (set-user-dirs!))
+(defmethod post-env! :watcher-debounce [key old new env] (set-user-dirs!))
 
-(defmulti merge-env!
-  "This function is used to modify how new values are merged into the boot atom
-  when `set-env!` is called. This function's result will become the new value
-  associated with the given `key` in the boot atom."
+(defmulti pre-env!
+  "This multimethod is used to modify how new values are merged into the boot
+  atom when `set-env!` is called. This function's result will become the new
+  value associated with the given `key` in the env atom."
   (fn [key old-value new-value env] key) :default ::default)
 
-(defn- assert-set [k new] (assert (set? new) (format "env %s must be a set" k)))
+(defn- merge-or-replace [x y]   (if-not (coll? x) y (into x y)))
+(defn- merge-if-coll    [x y]   (if-not (coll? x) x (into x y)))
+(defn- assert-set       [k new] (assert (set? new) (format "env %s must be a set" k)))
 
-(defmethod merge-env! ::default       [key old new env] new)
-(defmethod merge-env! :directories    [key old new env] (set/union old new))
-(defmethod merge-env! :source-paths   [key old new env] (assert-set key new) new)
-(defmethod merge-env! :resource-paths [key old new env] (assert-set key new) new)
-(defmethod merge-env! :asset-paths    [key old new env] (assert-set key new) new)
-(defmethod merge-env! :wagons         [key old new env] (add-wagon! old new env))
-(defmethod merge-env! :dependencies   [key old new env] (add-dependencies! old new env))
+(defmethod pre-env! ::default       [key old new env] new)
+(defmethod pre-env! :directories    [key old new env] (set/union old new))
+(defmethod pre-env! :source-paths   [key old new env] (assert-set key new) new)
+(defmethod pre-env! :resource-paths [key old new env] (assert-set key new) new)
+(defmethod pre-env! :asset-paths    [key old new env] (assert-set key new) new)
+(defmethod pre-env! :wagons         [key old new env] (add-wagon! old new env))
+(defmethod pre-env! :dependencies   [key old new env] (add-dependencies! old new env))
 
 (defn get-env
   "Returns the value associated with the key `k` in the boot environment, or
@@ -546,24 +575,40 @@
 
 (defn set-env!
   "Update the boot environment atom `this` with the given key-value pairs given
-  in `kvs`. See also `on-env!` and `merge-env!`. The values in the env map must
+  in `kvs`. See also `post-env!` and `pre-env!`. The values in the env map must
   be both printable by the Clojure printer and readable by its reader. If the
   value for a key is a function, that function will be applied to the current
   value of that key and the result will become the new value (similar to how
   clojure.core/update-in works."
   [& kvs]
   (doseq [[k v] (order-set-env-keys (partition 2 kvs))]
-    (let [v (if-not (fn? v) v (v (get-env k)))]
-      (assert (printable-readable? v)
-        (format "value not readable by Clojure reader\n%s => %s" (pr-str k) (pr-str v)))
-      (swap! boot-env update-in [k] (partial merge-env! k) v @boot-env))))
+    (let [v'  (if-not (fn? v) v (v (get-env k)))
+          v'' (if-let [b (get @cli-base k)] (merge-if-coll b v') v')]
+      (assert (printable-readable? v'')
+              (format "value not readable by Clojure reader\n%s => %s" (pr-str k) (pr-str v'')))
+      (swap! boot-env update-in [k] (partial pre-env! k) v'' @boot-env))))
+
+(defn merge-env!
+  "Merges the new values into the current values for the given keys in the env
+  map. Uses a merging strategy that is appropriate for the given key (eg. uses
+  clojure.core/into for keys whose values are collections and simply replaces
+  Keys whose values aren't collections)."
+  [& kvs]
+  (->> (partition 2 kvs)
+       (mapcat (fn [[k v]] [k #(merge-or-replace % v)]))
+       (apply set-env!)))
 
 ;; Defining Tasks ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defmacro deftask
   "Define a boot task."
   [sym & forms]
-  `(cli2/defclifn ~(vary-meta sym assoc ::task true) ~@forms))
+  `(do
+     (when-let [existing-deftask# (resolve '~sym)]
+       (when (= *ns* (-> existing-deftask# meta :ns))
+         (boot.util/warn
+          "Warning: deftask %s/%s was overridden\n" *ns* '~sym)))
+     (cli2/defclifn ~(vary-meta sym assoc ::task true) ~@forms)))
 
 ;; Boot Lifecycle ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -645,7 +690,7 @@
   result is passed to the next handler in the pipeline. The fileset obtained
   from the next handler is then returned up the handler stack. The body must
   evaluate to a fileset object. Roughly equivalent to:
-  
+
       (fn [next-handler]
         (fn [binding]
           (next-handler (do ... ...))))
@@ -668,13 +713,13 @@
   handler is called with the current fileset, and the result is bound to
   binding. The body expressions are then evaluated for side effects and the
   bound fileset is returned up the handler stack. Roughly equivalent to:
-  
+
       (fn [next-handler]
         (fn [fileset]
           (let [binding (next-handler fileset)]
             (do ... ...)
             binding)))
-  
+
   where ... are the given body expressions."
   `(fn [next-task#]
      (fn [fileset#]
@@ -730,7 +775,7 @@
       (task-options!
         repl {:port     12345}
         jar  {:manifest {:howdy \"world\"}})
-  
+
   You can update options, too, by providing a function instead of an option
   map. This function will be passed the current option map and its result will
   be used as the new one. For example:
